@@ -57,13 +57,13 @@
 
     async function loadView(view, { silent = false } = {}) {
         const loadId = ++state.loadId;
-        const titles = { overview: 'Overview', users: 'Users', cards: 'Cards', purchases: 'Purchases', deposits: 'Deposits', transactions: 'Transactions', withdrawals: 'Withdrawals', reconciliation: 'Payment Reconciliation', kyc: 'KYC Review', redemptions: 'Redemptions', audit: 'Audit Logs', settings: 'Settings' };
+        const titles = { overview: 'Overview', users: 'Users', cards: 'Cards', purchases: 'Purchases', deposits: 'Deposits', transactions: 'Transactions', withdrawals: 'Withdrawals', reconciliation: 'Payment Reconciliation', cardPayments: 'Card Payments', kyc: 'KYC Review', redemptions: 'Redemptions', audit: 'Audit Logs', settings: 'Settings', backup: 'Backup & Restore' };
         $('#pageTitle').textContent = titles[view] || 'Overview';
         if (!silent) $('#pageContent').innerHTML = `<div class="panel"><div class="empty">Loading ${escape(titles[view] || 'view')}…</div></div>`;
         try {
             if (view === 'overview') state.summary = await api('/api/admin/summary');
             else {
-                const endpoint = { users: '/api/admin/users', cards: '/api/admin/cards', purchases: '/api/admin/purchases', deposits: '/api/admin/deposits', transactions: '/api/admin/transactions', withdrawals: '/api/admin/withdrawals', kyc: '/api/admin/kyc', redemptions: '/api/admin/redemptions', audit: '/api/admin/audit-logs' }[view];
+                const endpoint = { users: '/api/admin/users', cards: '/api/admin/cards', purchases: '/api/admin/purchases', deposits: '/api/admin/deposits', transactions: '/api/admin/transactions', withdrawals: '/api/admin/withdrawals', cardPayments: '/api/admin/card-payments', kyc: '/api/admin/kyc', redemptions: '/api/admin/redemptions', audit: '/api/admin/audit-logs' }[view];
                 if (endpoint) state.cache[view] = await api(`${endpoint}?page=${state.page}&pageSize=25&search=${encodeURIComponent(state.search)}&status=${encodeURIComponent(state.status)}`);
             }
             if (loadId !== state.loadId || view !== state.view) return;
@@ -86,7 +86,7 @@
     }
 
     async function refreshInBackground() {
-        if (document.hidden || backgroundRefreshInFlight || $('#adminApp').classList.contains('is-hidden')) return;
+        if (document.hidden || backgroundRefreshInFlight || state.view === 'backup' || $('#adminApp').classList.contains('is-hidden')) return;
         const activeElement = document.activeElement;
         if (activeElement?.matches('input, textarea, select') || ($('#settingsSave') && !$('#settingsSave').disabled) || $('#actionModal').classList.contains('open') || $('#detailDrawer').classList.contains('open')) return;
         backgroundRefreshInFlight = true;
@@ -179,10 +179,11 @@
         const summary = state.summary; if (!summary) return;
         $('#withdrawalCount').textContent = summary.metrics.pendingWithdrawals || '';
         $('#kycCount').textContent = summary.metrics.pendingKyc || '';
+        $('#cardPaymentCount').textContent = summary.metrics.paymentsNeedingReview || '';
     }
 
     function render(view) {
-        const renderers = { overview: renderOverview, users: renderUsers, cards: renderCards, purchases: renderPurchases, deposits: renderDeposits, transactions: renderTransactions, withdrawals: renderWithdrawals, kyc: renderKyc, redemptions: renderRedemptions, audit: renderAudit, settings: renderSettings, reconciliation: renderReconciliation };
+        const renderers = { overview: renderOverview, users: renderUsers, cards: renderCards, purchases: renderPurchases, deposits: renderDeposits, transactions: renderTransactions, withdrawals: renderWithdrawals, kyc: renderKyc, redemptions: renderRedemptions, audit: renderAudit, backup: renderBackup, settings: renderSettings, reconciliation: renderReconciliation, cardPayments: renderCardPayments };
         $('#pageContent').innerHTML = renderers[view] ? renderers[view]() : renderOverview();
     }
 
@@ -350,7 +351,87 @@
             render('settings');
         } catch (error) { toast(error.message); syncSettingsControls(); }
     }
+    // ---- Backup & restore -------------------------------------------------
+    let pendingRestore = null;
+    function renderBackup() {
+        pendingRestore = null;
+        const download = `<p class="backup-copy">Downloads everything on the site as one file: users, balances, cards, purchases, payments, withdrawals, settings and audit logs. Use it to keep a safe copy or to move the site to another Railway project.</p>
+            <label class="backup-check"><input type="checkbox" id="backupKyc" checked /> Include KYC documents (larger file)</label>
+            <p class="backup-warn">This file contains customers' personal data. Store it somewhere private and never share it.</p>
+            <button class="primary-button" id="backupDownload" type="button">Download backup</button>`;
+        const restore = `<p class="backup-copy">Choose a backup file you downloaded here before. It also accepts a raw <code>phantom-cards.json</code> copied from a volume.</p>
+            <input type="file" id="restoreFile" accept=".json,application/json" />
+            <div class="backup-summary" id="restoreSummary"></div>
+            <div id="restoreConfirmBox" class="is-hidden">
+                <p class="backup-warn danger">This replaces ALL current data on this site with the file's contents. A safety copy of the current data is saved on the server first. Customers who are signed in may be signed out.</p>
+                <label class="backup-confirm">Type <b>RESTORE</b> to confirm<input id="restoreConfirm" autocomplete="off" placeholder="RESTORE" /></label>
+                <button class="danger-button" id="restoreRun" type="button" disabled>Restore this backup</button>
+            </div>`;
+        return pageHeading('Backup & Restore', 'Download all site data, or upload a backup to restore it.') + `<div class="backup-grid">${panel('Download data', download)}${panel('Upload / restore data', restore)}</div>`;
+    }
+    async function downloadBackup() {
+        const button = $('#backupDownload'); const label = button.textContent;
+        button.disabled = true; button.textContent = 'Preparing…';
+        try {
+            const response = await fetch(`/api/admin/backup?kyc=${$('#backupKyc').checked ? 1 : 0}`, { credentials: 'same-origin' });
+            if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(data.error || 'Download failed.'); }
+            const blob = await response.blob();
+            const name = (response.headers.get('content-disposition') || '').match(/filename="([^"]+)"/)?.[1] || 'phantom-cards-backup.json';
+            const link = document.createElement('a'); const href = URL.createObjectURL(blob);
+            link.href = href; link.download = name; document.body.appendChild(link); link.click(); link.remove();
+            window.setTimeout(() => URL.revokeObjectURL(href), 10000);
+            toast('Backup downloaded.');
+        } catch (error) { toast(error.message); }
+        finally { button.disabled = false; button.textContent = label; }
+    }
+    async function chooseRestoreFile(input) {
+        const summary = $('#restoreSummary'); const box = $('#restoreConfirmBox');
+        pendingRestore = null; box.classList.add('is-hidden'); summary.innerHTML = '';
+        const file = input.files?.[0]; if (!file) return;
+        try {
+            const parsed = JSON.parse(await file.text());
+            const database = parsed?.format === 'phantom-cards-backup' ? parsed.db : parsed;
+            if (!database || !Array.isArray(database.users) || !Array.isArray(database.cards)) throw new Error('not a backup');
+            pendingRestore = parsed;
+            const rows = [['Users', database.users.length], ['Purchases', (database.purchases || []).length], ['Transactions', (database.transactions || []).length], ['Withdrawals', (database.withdrawals || []).length], ['KYC documents', (parsed.kycDocuments || []).length]];
+            summary.innerHTML = `<strong>${escape(file.name)}</strong>${parsed.exportedAt ? `<small>Exported ${escape(date(parsed.exportedAt))}</small>` : '<small>Raw data file (no KYC documents)</small>'}<ul>${rows.map(([k, v]) => `<li><span>${escape(k)}</span><b>${Number(v).toLocaleString()}</b></li>`).join('')}</ul>`;
+            box.classList.remove('is-hidden'); $('#restoreConfirm').value = ''; $('#restoreRun').disabled = true;
+        } catch { summary.innerHTML = '<p class="backup-warn danger">That file is not a valid Phantom Cards backup.</p>'; }
+    }
+    async function runRestore() {
+        if (!pendingRestore || $('#restoreConfirm').value.trim() !== 'RESTORE') return;
+        const button = $('#restoreRun'); button.disabled = true; button.textContent = 'Restoring…';
+        try {
+            const result = await api('/api/admin/restore', { method: 'POST', body: JSON.stringify({ backup: pendingRestore, confirm: 'RESTORE' }) });
+            pendingRestore = null;
+            $('#restoreSummary').innerHTML = `<p class="backup-ok">Restore complete: ${Number(result.counts.users).toLocaleString()} users and ${Number(result.counts.purchases).toLocaleString()} purchases loaded.<br><small>Previous data kept on the server as ${escape(result.safetyCopy)}</small></p>`;
+            $('#restoreConfirmBox').classList.add('is-hidden'); $('#restoreFile').value = '';
+            toast('Backup restored.');
+        } catch (error) { toast(error.message); button.disabled = false; button.textContent = 'Restore this backup'; }
+    }
     function renderSettings() { const s = state.summary?.settings || {}; return pageHeading('Settings', 'Operational configuration. Every value below can be edited.') + payoutPanel(s) + tiersPanel(s) + popupsPanel(s) + settingsPanel(s) + `<div class="settings-grid" style="margin-top:16px"><div class="setting"><span>Payment service</span><strong>${s.hubConfigured ? 'Configured' : 'Not configured'}</strong></div></div><div class="panel" style="margin-top:16px"><div class="panel-heading"><h3>Financial safety</h3></div><p style="color:var(--muted);line-height:1.7;margin:0">Direct balance editing, payment status editing, transaction editing, and environment-secret editing are not available in this console. Corrections must be represented by controlled backend workflows and audited compensating records.</p></div>`; }
+    function renderCardPayments() {
+        const data = state.cache.cardPayments;
+        const rows = data.items.map(item => {
+            const credited = item.adminCredit ? `<small><strong>Credited by admin</strong> · ${escape(item.adminCredit.by)}</small>` : '';
+            const hub = item.lastHubStatus ? `<small>Hub: ${escape(item.lastHubStatus)} · ${escape(item.checkCount || 0)} checks</small>` : '';
+            const actions = item.canCredit
+                ? `<div class="row-actions">${item.paystackReference ? `<button class="tiny-button" data-recheck="${escape(item.transactionId)}" title="Ask the payment hub for the latest status and issue the card if it was paid">Re-check</button>` : ''}<button class="tiny-button" data-action="credit-payment" data-id="${escape(item.transactionId)}" title="Issue the card to the customer for this payment">Credit card</button></div>`
+                : '—';
+            return `<tr><td><strong>${escape(item.transactionId)}</strong><small>${escape(item.paystackReference || 'No hub reference')}</small></td><td>${escape(item.userName)}<small>${escape(item.userEmail || item.userId)}</small></td><td>${escape(item.cardTitle)}</td><td class="amount">${money(item.amount)}</td><td>${status(item.status)}${hub}${credited}</td><td>${shortDate(item.createdAt)}</td><td>${actions}</td></tr>`;
+        }).join('');
+        return pageHeading('Card payments', 'Every checkout and its outcome. Use Credit card when a customer paid but never received their card.')
+            + toolbar('Search payment ID, Paystack reference, user, or card…', `<select id="statusFilter"><option value="">All statuses</option><option value="FAILED"${state.status === 'FAILED' ? ' selected' : ''}>Failed</option><option value="EXPIRED"${state.status === 'EXPIRED' ? ' selected' : ''}>Expired</option><option value="PAYMENT_INITIALIZED"${state.status === 'PAYMENT_INITIALIZED' ? ' selected' : ''}>Awaiting payment</option><option value="PAID_UNFULFILLED"${state.status === 'PAID_UNFULFILLED' ? ' selected' : ''}>Paid, not issued</option><option value="PAID_DUPLICATE"${state.status === 'PAID_DUPLICATE' ? ' selected' : ''}>Paid twice</option><option value="PAID_AMOUNT_MISMATCH"${state.status === 'PAID_AMOUNT_MISMATCH' ? ' selected' : ''}>Amount mismatch</option><option value="SUCCESS"${state.status === 'SUCCESS' ? ' selected' : ''}>Success</option></select>`)
+            + `<section class="panel table-panel">${table(['Payment', 'Customer', 'Card', 'Amount', 'Status', 'Created', 'Actions'], rows, 'No card payments found.')}${pagination(data)}</section>`;
+    }
+    async function recheckPayment(button) {
+        const id = button.dataset.recheck; button.disabled = true; button.textContent = 'Checking…';
+        try {
+            const result = await api(`/api/admin/card-payments/${encodeURIComponent(id)}/recheck`, { method: 'POST', body: '{}' });
+            toast(result.purchaseId ? 'Payment confirmed with the hub: the card has been issued.' : `Hub re-check done. Payment is ${String(result.status || 'unknown').replaceAll('_', ' ').toLowerCase()}.`);
+            await loadView(state.view);
+        } catch (error) { toast(error.message); button.disabled = false; button.textContent = 'Re-check'; }
+    }
     function renderReconciliation() { return pageHeading('Payment reconciliation', 'Compare app and Payment Hub references before investigating a top-up.') + `<section class="panel"><div class="panel-heading"><h3>Open a deposit from the Deposits page</h3></div><p style="margin:0;color:var(--muted);line-height:1.7">Deposits store the Payment Hub / Paystack reference alongside the local record, so the console clearly labels any unavailable external data instead of inventing a status.</p><button class="primary-button" style="margin-top:18px" data-go="deposits">View deposits</button></section>`; }
 
     async function openDetail(type, id) {
@@ -369,11 +450,13 @@
     function reconLine(label, value) { return `<div class="recon-line"><span>${escape(label)}</span><strong>${typeof value === 'string' && value.startsWith('<span') ? value : escape(value)}</strong></div>`; }
     function renderObjectDrawer(type, value) { if (!value) return '<div class="empty">Record not found.</div>'; const title = value.title || value.reason || value.cardTitle || value.reference || value.orderId || value.id; const entries = Object.entries(value).filter(([key, val]) => val !== undefined && val !== null && typeof val !== 'object' && !['passwordHash', 'pinHash', 'idempotencyKey'].includes(key)).slice(0, 24); return `<p class="eyebrow">${escape(type.toUpperCase())} DETAIL</p><h2 class="drawer-title">${escape(title)}</h2><p class="drawer-subtitle">Read-only operational record</p><div class="detail-grid">${entries.map(([key, val]) => `<div class="detail-cell"><span>${escape(key.replaceAll(/([A-Z])/g, ' $1'))}</span><strong>${escape(String(val))}</strong></div>`).join('')}</div>`; }
 
-    function openAction(action, id) { state.action = { action, id }; const copy = { approve: ['Approve withdrawal', 'This will mark the pending withdrawal as approved. Confirm the requested amount and payout before continuing.'], reject: ['Reject withdrawal', 'This will reject the withdrawal and return the requested amount to Redeemed Balance.'], 'verify-kyc': ['Verify KYC', 'This will verify the user and release their KYC-blocked withdrawals to the pending queue.'], 'reject-kyc': ['Reject KYC', 'This will mark the user KYC as rejected. A reason is required.'], 'block-user': ['Block user', 'This will immediately sign the user out and prevent them from logging in, buying cards, or withdrawing until unblocked. A reason is required.'], 'unblock-user': ['Unblock user', 'This will restore the user\'s ability to sign in, buy cards, and withdraw.'] }[action]; const eyebrow = { approve: 'WITHDRAWAL REVIEW', reject: 'WITHDRAWAL REVIEW', 'verify-kyc': 'KYC REVIEW', 'reject-kyc': 'KYC REVIEW', 'block-user': 'ACCOUNT ACCESS', 'unblock-user': 'ACCOUNT ACCESS' }[action]; $('#actionEyebrow').textContent = eyebrow; $('#actionTitle').textContent = copy[0]; $('#actionCopy').textContent = copy[1]; $('#actionNote').value = ''; $('#actionError').textContent = ''; $('#actionModal').classList.add('open'); }
-    async function confirmAction() { const { action, id } = state.action || {}; const note = $('#actionNote').value.trim(); if (!note) return $('#actionError').textContent = 'A reason or note is required.'; const endpoint = { approve: `/api/admin/withdrawals/${encodeURIComponent(id)}/approve`, reject: `/api/admin/withdrawals/${encodeURIComponent(id)}/reject`, 'verify-kyc': `/api/admin/users/${encodeURIComponent(id)}/kyc/verify`, 'reject-kyc': `/api/admin/users/${encodeURIComponent(id)}/kyc/reject`, 'block-user': `/api/admin/users/${encodeURIComponent(id)}/block`, 'unblock-user': `/api/admin/users/${encodeURIComponent(id)}/unblock` }[action]; try { $('#actionConfirm').disabled = true; await api(endpoint, { method: 'POST', body: JSON.stringify({ note }) }); $('#actionModal').classList.remove('open'); toast('Action completed and recorded in the audit log.'); if (action === 'block-user' || action === 'unblock-user') { if (state.view === 'users') await loadView(state.view); await openDetail('user', id); } else { await loadView(state.view); } } catch (error) { $('#actionError').textContent = error.message; } finally { $('#actionConfirm').disabled = false; } }
+    function openAction(action, id) { state.action = { action, id }; const copy = { approve: ['Approve withdrawal', 'This will mark the pending withdrawal as approved. Confirm the requested amount and payout before continuing.'], reject: ['Reject withdrawal', 'This will reject the withdrawal and return the requested amount to Redeemed Balance.'], 'verify-kyc': ['Verify KYC', 'This will verify the user and release their KYC-blocked withdrawals to the pending queue.'], 'reject-kyc': ['Reject KYC', 'This will mark the user KYC as rejected. A reason is required.'], 'block-user': ['Block user', 'This will immediately sign the user out and prevent them from logging in, buying cards, or withdrawing until unblocked. A reason is required.'], 'unblock-user': ['Unblock user', 'This will restore the user\'s ability to sign in, buy cards, and withdraw.'], 'credit-payment': ['Credit card to customer', 'This issues the card for this payment straight into the customer\'s Redeem list, even though the automatic check did not confirm it. Only do this after you have confirmed in the Paystack dashboard that the money was received. It can be done once per payment, is recorded in the audit log, and does not use up the customer\'s daily purchase limit. Enter the reason (for example the Paystack reference you checked).'] }[action]; const eyebrow = { approve: 'WITHDRAWAL REVIEW', reject: 'WITHDRAWAL REVIEW', 'verify-kyc': 'KYC REVIEW', 'reject-kyc': 'KYC REVIEW', 'block-user': 'ACCOUNT ACCESS', 'unblock-user': 'ACCOUNT ACCESS', 'credit-payment': 'CARD PAYMENT' }[action]; $('#actionEyebrow').textContent = eyebrow; $('#actionTitle').textContent = copy[0]; $('#actionCopy').textContent = copy[1]; $('#actionNote').value = ''; $('#actionError').textContent = ''; $('#actionModal').classList.add('open'); }
+    async function confirmAction() { const { action, id } = state.action || {}; const note = $('#actionNote').value.trim(); if (!note) return $('#actionError').textContent = 'A reason or note is required.'; const endpoint = { approve: `/api/admin/withdrawals/${encodeURIComponent(id)}/approve`, reject: `/api/admin/withdrawals/${encodeURIComponent(id)}/reject`, 'verify-kyc': `/api/admin/users/${encodeURIComponent(id)}/kyc/verify`, 'reject-kyc': `/api/admin/users/${encodeURIComponent(id)}/kyc/reject`, 'block-user': `/api/admin/users/${encodeURIComponent(id)}/block`, 'unblock-user': `/api/admin/users/${encodeURIComponent(id)}/unblock`, 'credit-payment': `/api/admin/card-payments/${encodeURIComponent(id)}/credit` }[action]; try { $('#actionConfirm').disabled = true; await api(endpoint, { method: 'POST', body: JSON.stringify({ note }) }); $('#actionModal').classList.remove('open'); toast(action === 'credit-payment' ? 'Card credited to the customer and recorded in the audit log.' : 'Action completed and recorded in the audit log.'); if (action === 'block-user' || action === 'unblock-user') { if (state.view === 'users') await loadView(state.view); await openDetail('user', id); } else { await loadView(state.view); } } catch (error) { $('#actionError').textContent = error.message; } finally { $('#actionConfirm').disabled = false; } }
 
     document.addEventListener('input', event => { if (event.target.matches?.('#settingsForm [data-setting]')) syncSettingsControls(); });
     document.addEventListener('click', event => {
+        if (event.target.closest('#backupDownload')) return downloadBackup();
+        if (event.target.closest('#restoreRun')) return runRestore();
         const balanceBtn = event.target.closest('[data-toggle-balance]');
         if (balanceBtn) return toggleBalancePurchase(balanceBtn);
         const payoutBtn = event.target.closest('[data-toggle-payout]');
@@ -386,6 +469,7 @@
         if (event.target.closest('#settingsReset')) { document.querySelectorAll('#settingsForm [data-setting]').forEach(i => { i.value = i.dataset.original; }); return syncSettingsControls(); }
         const navButton = event.target.closest('[data-view]'); if (navButton) return nav(navButton.dataset.view);
         const go = event.target.closest('[data-go]'); if (go) return nav(go.dataset.go);
+        const recheck = event.target.closest('[data-recheck]'); if (recheck) return recheckPayment(recheck);
         const action = event.target.closest('[data-action]'); if (action) return openAction(action.dataset.action, action.dataset.id);
         const detail = event.target.closest('[data-detail-type]'); if (detail) return openDetail(detail.dataset.detailType, detail.dataset.detailId);
         const pageButton = event.target.closest('[data-page]'); if (pageButton && !pageButton.disabled) { state.page += pageButton.dataset.page === 'next' ? 1 : -1; return loadView(state.view); }
@@ -400,6 +484,8 @@
     $('#actionConfirm').addEventListener('click', confirmAction);
     document.addEventListener('keydown', event => { if (event.key === 'Escape') { $('#detailDrawer').classList.remove('open'); $('#actionModal').classList.remove('open'); $('#overlay').classList.remove('open'); } });
     document.addEventListener('click', event => { if (event.target.id === 'applyFilters') { state.search = $('#viewSearch')?.value || ''; state.status = $('#statusFilter')?.value || ''; state.page = 1; loadView(state.view); } });
+    document.addEventListener('change', event => { if (event.target.id === 'restoreFile') chooseRestoreFile(event.target); });
+    document.addEventListener('input', event => { if (event.target.id === 'restoreConfirm') $('#restoreRun').disabled = !pendingRestore || event.target.value.trim() !== 'RESTORE'; });
     document.addEventListener('keydown', event => { if (event.key === 'Enter' && event.target.id === 'viewSearch') $('#applyFilters')?.click(); });
     api('/api/admin/auth/session').then(result => showApp(result.admin)).catch(() => showLogin());
     initPullToRefresh();
