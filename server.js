@@ -952,8 +952,14 @@ async function hubCall(method, urlPath, payload) {
     body: method === 'GET' ? undefined : raw,
     signal: AbortSignal.timeout(10000),
   });
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok || !result.status) throw new Error(result.message || 'Hub request failed.');
+  const text = await response.text().catch(() => '');
+  let result = {};
+  try { result = JSON.parse(text); } catch { /* non-JSON reply: proxy error page, wrong URL, crashed hub */ }
+  if (!response.ok || !result.status) {
+    // Log what the hub really said, so "Hub request failed" is diagnosable from the Railway logs.
+    console.error('[hub:error]', method, `${HUB_BASE_URL}${urlPath}`, 'HTTP', response.status, text.slice(0, 300).replace(/\s+/g, ' '));
+    throw new Error(result.message || `Hub request failed (HTTP ${response.status}).`);
+  }
   return result.data;
 }
 // Verifies a webhook the hub sends back TO Phantom Cards: HMAC-SHA512 of the exact raw
