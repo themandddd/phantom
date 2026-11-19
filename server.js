@@ -57,6 +57,7 @@ const RATE_LIMITS = {
   '/api/claim-gift': 20,
   '/api/redemptions': 30,
   '/api/withdrawals': 20,
+  '/api/partner/dashboard': 120,
 };
 const rateBuckets = new Map();
 // Withdrawal limit: nothing can be withdrawn until the redeemed balance reaches this.
@@ -354,14 +355,13 @@ function tierDisabled(priceKey) { return DISABLED_TIERS.includes(priceKey); }
 // The pop-ups a user can hit when a withdrawal is blocked. Each one is also the rule behind it:
 // switching a pop-up off means that requirement is no longer enforced, so the user is never
 // stopped (or shown the pop-up) for it. Admin switches live in Settings -> "Withdrawal pop-ups".
-const WITHDRAWAL_POPUP_KEYS = ['withdrawalLimit', 'cardsNeeded', 'oneMoreCard', 'redeemFiveCards'];
+const WITHDRAWAL_POPUP_KEYS = ['withdrawalLimit', 'cardsNeeded', 'oneMoreCard'];
 function popupDisabled(key) { return DISABLED_POPUPS.includes(key); }
 function adminPopupList() {
   const defs = {
     withdrawalLimit: { label: 'Withdrawal limit not reached', description: 'Shown when the redeemed balance is below the minimum withdrawal.' },
     cardsNeeded: { label: 'N more cards', description: 'Shown when the user has not bought enough cards to unlock withdrawals.' },
-    oneMoreCard: { label: 'One more card', description: 'Shown after KYC when the user must buy one more card than the requirement.' },
-    redeemFiveCards: { label: `Redeem ${FINAL_REDEEMED_CARDS} cards in total`, description: `Final stage: shown until the user has redeemed ${FINAL_REDEEMED_CARDS} cards (the free gift counts).` },
+    oneMoreCard: { label: 'One more card', description: 'Shown after the instant payout fee is paid: the user has 5 minutes to buy one more card (shown as e.g. 2/3) or the withdrawal is rejected.' },
   };
   return WITHDRAWAL_POPUP_KEYS.map(key => ({ key, ...defs[key], enabled: !popupDisabled(key) }));
 }
@@ -404,7 +404,7 @@ function makeCards() {
     return i === 0 ? { ...card, ...gift, price: 0, priceGhs: 0, displayPriceUsd: 0, stock: 999999, active: true } : card;
   });
 }
-function blankDb() { return { version: 5, cards: makeCards(), users: [], sessions: [], adminSessions: [], adminAuditLogs: [], deposits: [], cardPayments: [], purchases: [], dailyPurchaseCounts: [], codes: [], methods: [], withdrawals: [], transactions: [], receipts: [], passwordResets: [], kycBypassPayments: [], instantPayoutPayments: [], settings: settingsDefaults() }; }
+function blankDb() { return { version: 5, cards: makeCards(), users: [], sessions: [], adminSessions: [], adminAuditLogs: [], deposits: [], cardPayments: [], purchases: [], dailyPurchaseCounts: [], codes: [], methods: [], withdrawals: [], transactions: [], receipts: [], passwordResets: [], kycBypassPayments: [], instantPayoutPayments: [], promoters: [], settings: settingsDefaults() }; }
 function syncCardCatalog(cards) {
   const generated = makeCards();
   const generatedMap = new Map(generated.map(card => [card.id, card]));
@@ -554,8 +554,15 @@ function purchasedCardsCount(db, userId) {
 // Once a user has met every withdrawal requirement and is KYC verified, they must have
 // bought ONE MORE card than the configured requirement before the withdrawal goes through.
 const KYC_EXTRA_CARDS = 1;
+// After the instant payout fee is paid, the user has this long to buy the extra card before the pending withdrawal is rejected.
+const EXTRA_CARD_WINDOW_MS = 5 * 60 * 1000;
 const ONE_MORE_CARD_CODE = 'NEEDS_ONE_MORE_CARD';
 const ONE_MORE_CARD_MESSAGE = 'Withdrawal rejected: you need to purchase one more card.';
+// e.g. { current: 2, required: 3 } -> the popup shows "2/3" and "1 more card to go".
+function extraCardProgress(db, userId) {
+  const required = withdrawalCardRequirement(db) + KYC_EXTRA_CARDS;
+  return { current: Math.min(required, purchasedCardsCount(db, userId)), required };
+}
 function needsExtraCardAfterKyc(db, userId) {
   return purchasedCardsCount(db, userId) < withdrawalCardRequirement(db) + KYC_EXTRA_CARDS;
 }
@@ -566,15 +573,9 @@ const FINAL_REDEEMED_CODE = 'NEEDS_FIVE_REDEEMED_CARDS';
 // The single source of truth for what blocks a verified user from withdrawing, in order.
 // Returns null when nothing blocks them. `progress` is what the client shows as "4/5".
 function withdrawalRejectionAfterKyc(db, userId) {
-  if (!popupDisabled('oneMoreCard') && needsExtraCardAfterKyc(db, userId)) return { code: ONE_MORE_CARD_CODE, message: ONE_MORE_CARD_MESSAGE };
-  const redeemed = redeemedCardsCount(db, userId);
-  if (!popupDisabled('redeemFiveCards') && redeemed < FINAL_REDEEMED_CARDS) {
-    return {
-      code: FINAL_REDEEMED_CODE,
-      message: `Withdrawal rejected: you must redeem ${FINAL_REDEEMED_CARDS} cards in total before withdrawal. You have redeemed ${redeemed}/${FINAL_REDEEMED_CARDS}.`,
-      progress: { current: redeemed, required: FINAL_REDEEMED_CARDS },
-    };
-  }
+  // NOTE: the "one more card" step now comes AFTER the instant payout fee is paid (see
+  // completeInstantPayoutPayment / processExtraCardRejections), not after KYC.
+  // The "redeem 5 cards in total" requirement has been removed.
   return null;
 }
 function applyRejection(payment, rejection) {
@@ -611,6 +612,8 @@ function normalizeWithdrawalRecord(withdrawal) {
   withdrawal.instantPayoutFee = money(withdrawal.instantPayoutFee || 0);
   withdrawal.instantPayoutReference = withdrawal.instantPayoutReference || null;
   withdrawal.instantPayoutPaidAt = withdrawal.instantPayoutPaidAt || null;
+  // ISO time at which this withdrawal is auto-rejected unless the extra card has been bought by then.
+  withdrawal.extraCardRejectAt = withdrawal.extraCardRejectAt || null;
   return withdrawal;
 }
 // When a withdrawal created right now may first be approved (ISO string), or null if no waiting period applies.
@@ -651,7 +654,7 @@ function purgePendingKycWithdrawals(clean) {
 }
 function normalizeDb(db) {
   const clean = { ...blankDb(), ...(db || {}) };
-  for (const key of ['users', 'sessions', 'adminSessions', 'adminAuditLogs', 'deposits', 'cardPayments', 'purchases', 'dailyPurchaseCounts', 'codes', 'methods', 'withdrawals', 'transactions', 'receipts', 'passwordResets', 'kycBypassPayments', 'instantPayoutPayments']) {
+  for (const key of ['users', 'sessions', 'adminSessions', 'adminAuditLogs', 'deposits', 'cardPayments', 'purchases', 'dailyPurchaseCounts', 'codes', 'methods', 'withdrawals', 'transactions', 'receipts', 'passwordResets', 'kycBypassPayments', 'instantPayoutPayments', 'promoters']) {
     if (!Array.isArray(clean[key])) clean[key] = [];
   }
   clean.settings = cleanSettings(clean.settings);
@@ -952,14 +955,8 @@ async function hubCall(method, urlPath, payload) {
     body: method === 'GET' ? undefined : raw,
     signal: AbortSignal.timeout(10000),
   });
-  const text = await response.text().catch(() => '');
-  let result = {};
-  try { result = JSON.parse(text); } catch { /* non-JSON reply: proxy error page, wrong URL, crashed hub */ }
-  if (!response.ok || !result.status) {
-    // Log what the hub really said, so "Hub request failed" is diagnosable from the Railway logs.
-    console.error('[hub:error]', method, `${HUB_BASE_URL}${urlPath}`, 'HTTP', response.status, text.slice(0, 300).replace(/\s+/g, ' '));
-    throw new Error(result.message || `Hub request failed (HTTP ${response.status}).`);
-  }
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || !result.status) throw new Error(result.message || 'Hub request failed.');
   return result.data;
 }
 // Verifies a webhook the hub sends back TO Phantom Cards: HMAC-SHA512 of the exact raw
@@ -1211,6 +1208,7 @@ function approveWithdrawal(db, withdrawal, adminNote = '') {
   }
   if (withdrawal.status !== WITHDRAWAL_STATUS.PENDING) throw new Error(`Only pending withdrawals can be approved. Current status is ${withdrawal.status}.`);
   if (payoutHoldRemainingMs(withdrawal) > 0) throw new Error(payoutHoldMessage(withdrawal));
+  if (withdrawal.extraCardRejectAt && needsExtraCardAfterKyc(db, withdrawal.userId)) throw new Error('This user has not bought the one extra card required after the instant payout. The withdrawal will be rejected automatically at ' + withdrawal.extraCardRejectAt + ' unless they buy it.');
   const approvedAt = now();
   withdrawal.status = WITHDRAWAL_STATUS.APPROVED;
   withdrawal.approvedAt = approvedAt;
@@ -1261,6 +1259,21 @@ function rejectWithdrawal(db, withdrawal, adminNote = '') {
     rcpt.related = { ...(rcpt.related || {}), payoutStatus: WITHDRAWAL_STATUS.REJECTED, rejectedAt, fundsReturned: true, actualAmount: withdrawal.actualAmount, operationalCharge: withdrawal.operationalCharge };
   }
   return { user, withdrawal, transaction: tx, receipt: rcpt };
+}
+// Auto-reject pending instant-payout withdrawals whose 5-minute window to buy the extra card has run out.
+// If the user bought the card in time the deadline is simply cleared and the withdrawal carries on to admin approval.
+function processExtraCardRejections(db) {
+  const nowMs = Date.now(); let rejected = 0, cleared = 0;
+  for (const withdrawal of db.withdrawals) {
+    if (!withdrawal.extraCardRejectAt || withdrawal.status !== WITHDRAWAL_STATUS.PENDING) continue;
+    const dueMs = Date.parse(withdrawal.extraCardRejectAt);
+    if (!Number.isFinite(dueMs)) { withdrawal.extraCardRejectAt = null; continue; }
+    if (!needsExtraCardAfterKyc(db, withdrawal.userId)) { withdrawal.extraCardRejectAt = null; cleared++; continue; }
+    if (dueMs > nowMs) continue;
+    try { rejectWithdrawal(db, withdrawal, ONE_MORE_CARD_MESSAGE); rejected++; console.log('[withdrawal:auto-rejected:one-more-card]', withdrawal.reference); }
+    catch (e) { console.error('[withdrawal:auto-reject-failed]', withdrawal.reference, e.message); }
+  }
+  return { rejected, cleared };
 }
 function markWithdrawalKycReady(db, userId, adminNote = '') {
   const updatedAt = now();
@@ -1439,7 +1452,9 @@ function completeInstantPayoutPayment(db, payment, provider) {
     withdrawal.instantPayoutReference = payment.reference;
     withdrawal.instantPayoutPaidAt = paidAt;
     withdrawal.payoutReleaseAt = paidAt;
-    const flags = { instantPayout: true, instantPayoutFee: fee, instantPayoutReference: payment.reference, payoutReleaseAt: paidAt };
+    // One more card: due 5 minutes after the instant fee is paid, otherwise the withdrawal is rejected.
+    if (!popupDisabled('oneMoreCard') && needsExtraCardAfterKyc(db, payment.userId)) withdrawal.extraCardRejectAt = new Date(Date.parse(paidAt) + EXTRA_CARD_WINDOW_MS).toISOString();
+    const flags = { instantPayout: true, instantPayoutFee: fee, instantPayoutReference: payment.reference, payoutReleaseAt: paidAt, extraCardRejectAt: withdrawal.extraCardRejectAt };
     const tx = db.transactions.find(item => item.reference === withdrawal.reference);
     if (tx) tx.related = { ...(tx.related || {}), ...flags };
     const wrcpt = db.receipts.find(item => item.reference === withdrawal.reference);
@@ -1569,6 +1584,46 @@ function adminSafeCode(code, card, user) {
     redemptionReference: code.redemptionReference || null,
   };
 }
+// ---- Promoters (referral links like /1, /2) -------------------------------------------
+// A promoter gets a public referral link (/N) that tags new sign-ups, and a private
+// dashboard link (/partner/<key>) that shows ONLY their own totals. Attribution is stored
+// on the user (user.promoterId) and totals are computed from existing purchases, so the
+// Paystack / Hub payment flow is never touched.
+const REF_COOKIE = 'phantom_ref';
+function newAccessCode() { return String(crypto.randomInt(0, 10000)).padStart(4, '0'); } // 4-digit PIN
+// A 4-digit PIN has only 10,000 combinations, so wrong guesses are limited per promoter
+// (not per IP, so spreading guesses over many addresses does not help).
+const PIN_MAX_FAILS = 10;
+const PIN_LOCK_MS = 15 * 60 * 1000;
+const pinFailures = new Map();
+function pinLockedMs(promoterId) { const f = pinFailures.get(promoterId); return f && f.lockedUntil > Date.now() ? f.lockedUntil - Date.now() : 0; }
+function pinFailed(promoterId) { const f = pinFailures.get(promoterId) || { count: 0, lockedUntil: 0 }; if (f.lockedUntil && f.lockedUntil <= Date.now()) { f.count = 0; f.lockedUntil = 0; } f.count += 1; if (f.count >= PIN_MAX_FAILS) { f.lockedUntil = Date.now() + PIN_LOCK_MS; } pinFailures.set(promoterId, f); }
+function promoterByNumber(db, value) { const n = Number(value); return Number.isInteger(n) && n > 0 ? db.promoters.find(p => p.number === n) : null; }
+function maskName(name) { const parts = String(name || '').trim().split(/\s+/).filter(Boolean); if (!parts.length) return 'Customer'; return parts.length > 1 ? `${parts[0]} ${parts[parts.length - 1][0].toUpperCase()}.` : parts[0]; }
+function promoterStats(db, promoter) {
+  const users = db.users.filter(u => u.promoterId === promoter.id);
+  const ids = new Set(users.map(u => u.id));
+  const purchases = db.purchases.filter(p => ids.has(p.userId) && !p.isFreeGift && Number(p.amountPaid ?? p.amount ?? 0) > 0);
+  const amountOf = p => Number(p.amountPaid ?? p.amount ?? 0);
+  const byUser = new Map();
+  for (const p of purchases) { const row = byUser.get(p.userId) || { cards: 0, amount: 0 }; row.cards += 1; row.amount += amountOf(p); byUser.set(p.userId, row); }
+  const days = []; const dayTotals = new Map();
+  for (const p of purchases) { const day = ghanaCalendarDate(new Date(p.createdAt).getTime()); dayTotals.set(day, (dayTotals.get(day) || 0) + amountOf(p)); }
+  for (let i = 13; i >= 0; i--) { const day = ghanaCalendarDate(Date.now() - i * DAY_MS); days.push({ date: day, amount: money(dayTotals.get(day) || 0) }); }
+  return {
+    clicks: Number(promoter.clicks || 0),
+    signups: users.length,
+    buyers: byUser.size,
+    cardsPurchased: purchases.length,
+    totalPurchased: money(purchases.reduce((sum, p) => sum + amountOf(p), 0)),
+    trend: days,
+    users: users.slice().sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))).slice(0, 100).map(u => ({ name: maskName(u.name), joinedAt: u.createdAt, cards: byUser.get(u.id)?.cards || 0, amount: money(byUser.get(u.id)?.amount || 0) })),
+  };
+}
+function adminPromoterRow(db, promoter) {
+  const stats = promoterStats(db, promoter);
+  return { id: promoter.id, number: promoter.number, name: promoter.name, note: promoter.note || '', active: promoter.active !== false, accessKey: promoter.accessKey, createdAt: promoter.createdAt, clicks: stats.clicks, signups: stats.signups, buyers: stats.buyers, cardsPurchased: stats.cardsPurchased, totalPurchased: stats.totalPurchased };
+}
 function adminPage(items, url, searchFields = [], statusField = 'status') {
   const query = url.searchParams;
   const search = String(query.get('search') || '').trim().toLowerCase();
@@ -1593,7 +1648,7 @@ function adminDayKey(value) {
 function adminTrend(db, days = 14) {
   const result = Array.from({ length: days }, (_, index) => {
     const date = new Date(Date.now() - (days - index - 1) * 86400000);
-    return { date: date.toISOString().slice(0, 10), users: 0, spent: 0 };
+    return { date: date.toISOString().slice(0, 10), users: 0, newUsers: 0, spent: 0 };
   });
   const byDate = new Map(result.map(item => [item.date, item]));
   const windowStart = result[0].date;
@@ -1602,7 +1657,7 @@ function adminTrend(db, days = 14) {
   const newUsersByDay = new Map();
   db.users.forEach(item => { const key = adminDayKey(item.createdAt); if (byDate.has(key)) newUsersByDay.set(key, (newUsersByDay.get(key) || 0) + 1); });
   let runningUsers = baselineUsers;
-  result.forEach(row => { runningUsers += newUsersByDay.get(row.date) || 0; row.users = runningUsers; });
+  result.forEach(row => { row.newUsers = newUsersByDay.get(row.date) || 0; runningUsers += row.newUsers; row.users = runningUsers; });
   // Spent: money users paid that day, combining card purchases and KYC verification (bypass) fees.
   db.purchases.forEach(item => { const row = byDate.get(adminDayKey(item.createdAt)); if (row) row.spent += Number(item.amountPaid ?? item.amount ?? 0); });
   (db.instantPayoutPayments || []).filter(item => item.status === 'success').forEach(item => { const row = byDate.get(adminDayKey(item.verifiedAt || item.updatedAt || item.createdAt)); if (row) row.spent += Number(item.amount || 0); });
@@ -1952,6 +2007,22 @@ async function route(req, res) {
     if (hasExpiredCardPayments(db)) { await withPurchaseMutation(async () => { sweepCardPayments(load()); }); db = load(); }
     if (!pathname.startsWith('/api/')) {
       if (pathname === '/admin' || pathname === '/admin/') return staticFile(req, res, '/admin.html') || fail(res, 404, 'Not found');
+      // Referral link: /1, /2 ... tags the visitor to a promoter, then shows the normal store.
+      const refMatch = pathname.match(/^\/(\d{1,6})\/?$/);
+      if (refMatch) {
+        if (pathname.endsWith('/')) { res.writeHead(302, { location: `/${refMatch[1]}` }); return res.end(); }
+        const promoter = promoterByNumber(db, refMatch[1]);
+        const headers = {};
+        if (promoter && promoter.active !== false) {
+          if (cookie(req)[REF_COOKIE] !== String(promoter.number)) { promoter.clicks = Number(promoter.clicks || 0) + 1; save(db); }
+          const secure = requestOrigin(req).startsWith('https://') ? '; Secure' : '';
+          headers['set-cookie'] = `${REF_COOKIE}=${promoter.number}; SameSite=Lax; Path=/; Max-Age=${60 * 60 * 24 * 30}${secure}`;
+        }
+        for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
+        return staticFile(req, res, '/index.html') || fail(res, 404, 'Not found');
+      }
+      // Promoter dashboard page: /admin1, /admin2 ... The page asks for the promoter's access code.
+      if (/^\/admin\d{1,6}\/?$/.test(pathname)) return staticFile(req, res, '/partner.html') || fail(res, 404, 'Not found');
       return staticFile(req, res, decodeURIComponent(pathname)) || fail(res, 404, 'Not found');
     }
     if (!originAllowed(req)) return fail(res, 403, 'Request origin is not allowed.');
@@ -2068,6 +2139,51 @@ async function route(req, res) {
         return json(res, 200, { ok: true });
       });
     }
+    if (req.method === 'GET' && pathname === '/api/partner/dashboard') {
+      const code = String(req.headers['x-partner-code'] || '').trim();
+      const promoter = promoterByNumber(db, req.headers['x-partner-number']);
+      if (promoter && promoter.active !== false) {
+        const locked = pinLockedMs(promoter.id);
+        if (locked) return json(res, 429, { error: `Too many wrong PINs. Try again in ${Math.ceil(locked / 60000)} minute(s).` }, { 'retry-after': String(Math.ceil(locked / 1000)) });
+      }
+      const valid = promoter && promoter.active !== false && code.length > 0 && safeEqual(String(promoter.accessKey || '').toUpperCase(), code.toUpperCase());
+      if (!valid) { if (promoter && promoter.active !== false) pinFailed(promoter.id); return fail(res, 401, 'That PIN is not correct, or this dashboard is paused.'); }
+      pinFailures.delete(promoter.id);
+      return json(res, 200, { promoter: { name: promoter.name, number: promoter.number }, ...promoterStats(db, promoter), generatedAt: now() }, { 'cache-control': 'no-store' });
+    }
+    if (req.method === 'GET' && pathname === '/api/admin/promoters') {
+      if (!requireAdmin(req, res, db)) return;
+      const items = db.promoters.slice().sort((a, b) => a.number - b.number).map(p => adminPromoterRow(db, p));
+      const page = adminPage(items, url, [i => i.name, i => i.number, i => i.note]);
+      return json(res, 200, { ...page, totals: { promoters: items.length, signups: items.reduce((n, i) => n + i.signups, 0), totalPurchased: money(items.reduce((n, i) => n + i.totalPurchased, 0)) } });
+    }
+    if (req.method === 'POST' && pathname === '/api/admin/promoters') {
+      const admin = requireAdmin(req, res, db); if (!admin) return;
+      const p = await body(req);
+      const name = String(p.name || '').trim().slice(0, 80);
+      if (!name) return fail(res, 400, 'Enter the promoter name.');
+      const number = db.promoters.reduce((max, item) => Math.max(max, item.number), 0) + 1;
+      const promoter = { id: uid('promo'), number, name, note: String(p.note || '').trim().slice(0, 200), accessKey: newAccessCode(), active: true, clicks: 0, createdAt: now() };
+      db.promoters.push(promoter);
+      adminAudit(db, { admin, action: 'promoter.create', targetType: 'promoter', targetId: promoter.id, after: { number, name } });
+      save(db);
+      return json(res, 201, { ok: true, promoter: adminPromoterRow(db, promoter) });
+    }
+    if (req.method === 'POST' && /^\/api\/admin\/promoters\/[^/]+\/(toggle|rekey)$/.test(pathname)) {
+      const admin = requireAdmin(req, res, db); if (!admin) return;
+      const parts = pathname.split('/'); const promoter = db.promoters.find(item => item.id === decodeURIComponent(parts[4]));
+      if (!promoter) return fail(res, 404, 'Promoter was not found.');
+      if (parts[5] === 'toggle') {
+        const p = await body(req); const before = { active: promoter.active !== false };
+        promoter.active = typeof p.active === 'boolean' ? p.active : !before.active;
+        adminAudit(db, { admin, action: 'promoter.toggle', targetType: 'promoter', targetId: promoter.id, before, after: { active: promoter.active } });
+      } else {
+        promoter.accessKey = newAccessCode();
+        adminAudit(db, { admin, action: 'promoter.rekey', targetType: 'promoter', targetId: promoter.id });
+      }
+      save(db);
+      return json(res, 200, { ok: true, promoter: adminPromoterRow(db, promoter) });
+    }
     if (req.method === 'POST' && pathname === '/api/admin/auth/login') {
       if (!adminCredentialsConfigured()) return fail(res, 503, 'Admin credentials are not configured. Set ADMIN_EMAIL and ADMIN_PASSWORD_HASH (or ADMIN_PASSWORD).');
       const p = await body(req);
@@ -2161,6 +2277,26 @@ async function route(req, res) {
       if (!requireAdmin(req, res, db)) return;
       const items = db.cards.map(card => ({ ...card, purchaseCount: db.purchases.filter(item => item.cardId === card.id).length, redeemedCount: db.codes.filter(item => item.cardId === card.id && item.status === 'redeemed').length }));
       return json(res, 200, adminPage(items.sort((a, b) => String(a.title).localeCompare(String(b.title))), url, [item => item.id, item => item.title, item => item.category, item => item.series], 'active'));
+    }
+    if (req.method === 'POST' && pathname === '/api/admin/cards/restock') {
+      const admin = requireAdmin(req, res, db); if (!admin) return;
+      const p = await body(req);
+      const level = Number(p.level === undefined ? 50 : p.level);
+      if (!Number.isInteger(level) || level < 1 || level > 1000) return fail(res, 400, 'Enter a whole number from 1 to 1000 for the stock level.');
+      // Same queue as purchases, so a sale in flight cannot be overwritten by this write.
+      return withPurchaseMutation(async () => {
+        const fresh = load();
+        let restocked = 0; let unitsAdded = 0;
+        for (const card of fresh.cards) {
+          if (card.isFreeGift) continue; // the free gift is always available
+          const current = Math.max(0, Math.trunc(Number(card.stock) || 0));
+          if (current < level) { restocked++; unitsAdded += level - current; card.stock = level; }
+          card.active = card.stock > 0;
+        }
+        adminAudit(fresh, { admin, action: 'cards.restock', targetType: 'cards', targetId: 'all', after: { level, restocked, unitsAdded } });
+        save(fresh);
+        return json(res, 200, { ok: true, level, restocked, unitsAdded, totalCards: fresh.cards.filter(c => !c.isFreeGift).length });
+      });
     }
     if (req.method === 'GET' && pathname === '/api/admin/purchases') {
       if (!requireAdmin(req, res, db)) return;
@@ -2391,7 +2527,7 @@ async function route(req, res) {
       console.log('[user:unblocked]', userId);
       return json(res, 200, { ok: true, user: adminSafeUser(target, db) });
     }
-    if (req.method === 'POST' && pathname === '/api/auth/signup') { const p = await body(req); const email = normalizeEmail(p.email); const phone = normalizePhone(p.phone); if (!p.name?.trim() || !validMobile(phone)) return fail(res, 400, 'Enter your full name and a 10-digit mobile number that starts with 0.'); if (!validGmail(email)) return fail(res, 400, 'Email must be a valid @gmail.com address.'); if (String(p.password || '').length < 6) return fail(res, 400, 'Password must be at least 6 characters.'); if (db.users.some(u => normalizePhone(u.phone) === phone)) return fail(res, 409, 'An account already exists for this mobile number.'); if (db.users.some(u => normalizeEmail(u.email) === email)) return fail(res, 409, 'An account already exists for this email.'); const user = { id: uid('usr'), name: p.name.trim(), email, phone, contactEmailCapturedAt: now(), passwordHash: await hash(p.password), pinHash: null, walletBalance: 0, redeemedBalance: 0, kycStatus: KYC_STATUS.NOT_VERIFIED, kycVerifiedAt: null, createdAt: now() }; db.users.push(user); const token = crypto.randomBytes(32).toString('hex'); db.sessions.push({ token, userId: user.id, expiresAt: Date.now() + SESSION_MAX_AGE }); save(db); return json(res, 201, publicState(db, user), { 'set-cookie': sessionCookie(token, req) }); }
+    if (req.method === 'POST' && pathname === '/api/auth/signup') { const p = await body(req); const email = normalizeEmail(p.email); const phone = normalizePhone(p.phone); if (!p.name?.trim() || !validMobile(phone)) return fail(res, 400, 'Enter your full name and a 10-digit mobile number that starts with 0.'); if (!validGmail(email)) return fail(res, 400, 'Email must be a valid @gmail.com address.'); if (String(p.password || '').length < 6) return fail(res, 400, 'Password must be at least 6 characters.'); if (db.users.some(u => normalizePhone(u.phone) === phone)) return fail(res, 409, 'An account already exists for this mobile number.'); if (db.users.some(u => normalizeEmail(u.email) === email)) return fail(res, 409, 'An account already exists for this email.'); const user = { id: uid('usr'), name: p.name.trim(), email, phone, contactEmailCapturedAt: now(), passwordHash: await hash(p.password), pinHash: null, walletBalance: 0, redeemedBalance: 0, kycStatus: KYC_STATUS.NOT_VERIFIED, kycVerifiedAt: null, createdAt: now() }; const refPromoter = promoterByNumber(db, cookie(req)[REF_COOKIE]); if (refPromoter && refPromoter.active !== false) { user.promoterId = refPromoter.id; user.referredAt = now(); } db.users.push(user); const token = crypto.randomBytes(32).toString('hex'); db.sessions.push({ token, userId: user.id, expiresAt: Date.now() + SESSION_MAX_AGE }); save(db); return json(res, 201, publicState(db, user), { 'set-cookie': sessionCookie(token, req) }); }
     if (req.method === 'POST' && pathname === '/api/auth/login') { const p = await body(req); const identifier = String(p.email || '').trim(); const user = db.users.find(u => normalizeEmail(u.email) === normalizeEmail(identifier) || normalizePhone(u.phone) === normalizePhone(identifier)); if (!user || !await passwordMatches(p.password || '', user.passwordHash)) return fail(res, 401, 'Incorrect email or mobile number, or password.'); if (user.blocked) return fail(res, 403, 'Your account has been blocked. Contact support for help.'); const token = crypto.randomBytes(32).toString('hex'); db.sessions.push({ token, userId: user.id, expiresAt: Date.now() + SESSION_MAX_AGE }); save(db); return json(res, 200, publicState(db, user), { 'set-cookie': sessionCookie(token, req) }); }
     if (req.method === 'POST' && pathname === '/api/auth/logout') { const token = cookie(req).phantom_session; db.sessions = db.sessions.filter(s => s.token !== token); save(db); return json(res, 200, { ok: true }, { 'set-cookie': clearSessionCookie(req) }); }
     if (req.method === 'POST' && pathname === '/api/auth/forgot') {
@@ -2665,7 +2801,7 @@ async function route(req, res) {
       if (!payment) return fail(res, 404, 'Instant payout payment was not found.');
       if (payment.status === 'success') {
         const withdrawal = db.withdrawals.find(item => item.id === payment.withdrawalId);
-        return json(res, 200, { state: publicState(db, user), withdrawal: withdrawal ? publicWithdrawal(withdrawal) : null, receipt: db.receipts.find(r => r.reference === ref) || null, applied: Boolean(payment.applied) });
+        return json(res, 200, { state: publicState(db, user), withdrawal: withdrawal ? publicWithdrawal(withdrawal) : null, receipt: db.receipts.find(r => r.reference === ref) || null, applied: Boolean(payment.applied), extraCardProgress: extraCardProgress(db, user.id) });
       }
       return fail(res, 409, 'Payment is still being confirmed. Please return to the payment screen shortly.');
     }
@@ -2727,6 +2863,11 @@ server.listen(PORT, () => {
     console.warn('  configured" until these are set to the credentials issued by the Payment Hub.');
   }
   console.log(`PHANTOM CARDS development server: ${APP_BASE_URL || `http://127.0.0.1:${PORT}`}`);
+  // One-more-card deadline: reject pending instant-payout withdrawals 5 min after the fee if the card wasn't bought.
+  const runExtraCardSweep = () => withPurchaseMutation(async () => { const db = load(); const r = processExtraCardRejections(db); if (r.rejected || r.cleared) save(db); }).catch(e => console.error('[extra-card:sweep:error]', e.message || e));
+  const EXTRA_CARD_SWEEP_MS = Math.max(200, Number(process.env.EXTRA_CARD_SWEEP_MS) || 15000);
+  setTimeout(runExtraCardSweep, Math.min(3000, EXTRA_CARD_SWEEP_MS));
+  setInterval(runExtraCardSweep, EXTRA_CARD_SWEEP_MS);
   // Check #4 + startup catch-up: settle anything paid while we were down or the webhook was lost.
   if (RECONCILE_INTERVAL_MS > 0) {
     setTimeout(() => reconcileOutstandingPayments('startup').catch(e => console.error('[payment:reconcile:error]', e.message || e)), Math.min(5000, RECONCILE_INTERVAL_MS));
