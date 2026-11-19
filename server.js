@@ -96,12 +96,13 @@ const SETTING_LIMITS = {
   operationalChargeRate: { min: 0, max: 0.5 },
   kycBypassFee: { min: 1, max: 100000 },
   payoutWaitDays: { min: 1, max: 90 },
+  extraCardWindowMinutes: { min: 1, max: 1440 },
   instantPayoutFee: { min: 1, max: 100000 },
   rewardMultiplierMin: { min: 0.1, max: 50 },
   rewardMultiplierMax: { min: 0.1, max: 50 },
 };
 function settingsDefaults() {
-  return { minWithdrawal: 100, minPurchasedCardsForWithdrawal: MIN_PURCHASED_CARDS_FOR_WITHDRAWAL, dailyPurchaseLimit: 3, tierPurchaseLimit: 2, operationalChargeRate: 0.10, kycBypassFee: 70, payoutWaitEnabled: true, payoutWaitDays: 7, instantPayoutEnabled: true, instantPayoutFee: 100, rewardMultiplierMin: 3.52, rewardMultiplierMax: 4.42, disabledTiers: [], disabledPopups: [] };
+  return { minWithdrawal: 100, minPurchasedCardsForWithdrawal: MIN_PURCHASED_CARDS_FOR_WITHDRAWAL, dailyPurchaseLimit: 3, tierPurchaseLimit: 2, operationalChargeRate: 0.10, kycBypassFee: 70, payoutWaitEnabled: true, payoutWaitDays: 7, instantPayoutEnabled: true, instantPayoutFee: 100, extraCardWindowMinutes: 60, rewardMultiplierMin: 3.52, rewardMultiplierMax: 4.42, disabledTiers: [], disabledPopups: [] };
 }
 // Tiers an admin has switched off. Unknown keys are dropped; order follows PRICE_TIERS.
 function cleanDisabledTiers(value) {
@@ -133,6 +134,7 @@ function cleanSettings(raw) {
     payoutWaitDays: pick('payoutWaitDays', src.payoutWaitDays, true),
     instantPayoutEnabled: src.instantPayoutEnabled === undefined ? d.instantPayoutEnabled : src.instantPayoutEnabled !== false && src.instantPayoutEnabled !== 'false',
     instantPayoutFee: pick('instantPayoutFee', src.instantPayoutFee),
+    extraCardWindowMinutes: pick('extraCardWindowMinutes', src.extraCardWindowMinutes, true),
     rewardMultiplierMin: pick('rewardMultiplierMin', src.rewardMultiplierMin),
     rewardMultiplierMax: pick('rewardMultiplierMax', src.rewardMultiplierMax),
     disabledTiers: cleanDisabledTiers(src.disabledTiers),
@@ -152,6 +154,7 @@ function applySettings(settings) {
   PAYOUT_WAIT_DAYS = s.payoutWaitDays;
   INSTANT_PAYOUT_ENABLED = s.instantPayoutEnabled;
   INSTANT_PAYOUT_FEE = s.instantPayoutFee;
+  EXTRA_CARD_WINDOW_MINUTES = s.extraCardWindowMinutes;
   DISABLED_TIERS = s.disabledTiers;
   DISABLED_POPUPS = s.disabledPopups;
   REWARD_MULTIPLIER_MIN = s.rewardMultiplierMin;
@@ -361,7 +364,7 @@ function adminPopupList() {
   const defs = {
     withdrawalLimit: { label: 'Withdrawal limit not reached', description: 'Shown when the redeemed balance is below the minimum withdrawal.' },
     cardsNeeded: { label: 'N more cards', description: 'Shown when the user has not bought enough cards to unlock withdrawals.' },
-    oneMoreCard: { label: 'One more card', description: 'Shown after the instant payout fee is paid: the user has 5 minutes to buy one more card (shown as e.g. 2/3) or the withdrawal is rejected.' },
+    oneMoreCard: { label: 'One more card', description: 'Shown after the instant payout fee is paid: the user has a time limit (set in Platform settings) to buy one more card, shown as a live countdown, or the withdrawal is rejected.' },
   };
   return WITHDRAWAL_POPUP_KEYS.map(key => ({ key, ...defs[key], enabled: !popupDisabled(key) }));
 }
@@ -554,8 +557,8 @@ function purchasedCardsCount(db, userId) {
 // Once a user has met every withdrawal requirement and is KYC verified, they must have
 // bought ONE MORE card than the configured requirement before the withdrawal goes through.
 const KYC_EXTRA_CARDS = 1;
-// After the instant payout fee is paid, the user has this long to buy the extra card before the pending withdrawal is rejected.
-const EXTRA_CARD_WINDOW_MS = 5 * 60 * 1000;
+// After the instant payout fee is paid, the user has this long (admin-editable, in minutes) to buy the extra card before the pending withdrawal is rejected.
+let EXTRA_CARD_WINDOW_MINUTES = 60;
 const ONE_MORE_CARD_CODE = 'NEEDS_ONE_MORE_CARD';
 const ONE_MORE_CARD_MESSAGE = 'Withdrawal rejected: you need to purchase one more card.';
 // e.g. { current: 2, required: 3 } -> the popup shows "2/3" and "1 more card to go".
@@ -665,7 +668,7 @@ function normalizeDb(db) {
   // credit. Convert that legacy ledger entry into an external refund and
   // materialize the missing withdrawal-history record before rebuilding
   // balances, so loading old data cannot re-credit Redeemed Balance.
-  clean.transactions.filter(tx => tx.reason === 'KYC bypass fee refund' || tx.related?.transactionType === 'REFUND').forEach(tx => {
+  clean.transactions.filter(tx => !tx.related?.refundedToBalance && (tx.reason === 'KYC bypass fee refund' || tx.related?.transactionType === 'REFUND')).forEach(tx => {
     const related = tx.related || {};
     const original = clean.withdrawals.find(item => item.id === related.withdrawalId || item.reference === related.withdrawalReference);
     tx.account = 'external';
@@ -684,7 +687,7 @@ function normalizeDb(db) {
       }));
     }
   });
-  clean.receipts.filter(rcpt => rcpt.type === 'kyc_bypass_refund' || rcpt.related?.transactionType === 'REFUND').forEach(rcpt => {
+  clean.receipts.filter(rcpt => !rcpt.related?.refundedToBalance && (rcpt.type === 'kyc_bypass_refund' || rcpt.related?.transactionType === 'REFUND')).forEach(rcpt => {
     rcpt.account = 'external';
     rcpt.status = 'refunded';
     rcpt.related = { ...(rcpt.related || {}), refund: true, transactionType: 'REFUND' };
@@ -878,6 +881,7 @@ function publicState(db, user) {
     payoutWaitDays: PAYOUT_WAIT_DAYS,
     instantPayoutEnabled: INSTANT_PAYOUT_ENABLED,
     instantPayoutFee: INSTANT_PAYOUT_FEE,
+    extraCardWindowMinutes: EXTRA_CARD_WINDOW_MINUTES,
     operationalChargeRate: OPERATIONAL_CHARGE_RATE,
     rewardMultiplierMin: REWARD_MULTIPLIER_MIN,
     rewardMultiplierMax: REWARD_MULTIPLIER_MAX,
@@ -1402,8 +1406,12 @@ function completeKycBypassPayment(db, payment, provider) {
       refundForWithdrawalId: withdrawal.id, refundForWithdrawalReference: withdrawal.reference,
       refundedAt, createdAt: refundedAt,
     }));
-    transaction(db, { userId: payment.userId, type: 'credit', entryType: 'REFUND', amount: fee, account: 'external', reference: refundReference, status: 'refunded', reason: 'KYC Fee Refund', related: { withdrawalId: withdrawal.id, withdrawalReference: withdrawal.reference, originalPaymentReference: payment.reference, refund: true, transactionType: 'REFUND', refundType: 'KYC_FEE_REFUND', provider } });
-    receipt(db, { userId: payment.userId, type: 'kyc_bypass_refund', amount: fee, account: 'external', reference: refundReference, status: 'refunded', related: { withdrawalId: withdrawal.id, withdrawalReference: withdrawal.reference, originalPaymentReference: payment.reference, refund: true, transactionType: 'REFUND', refundType: 'KYC_FEE_REFUND', provider } });
+    // Fee paid from redeemed balance -> the refund goes straight back into that balance (net zero).
+    // Fee paid at the secure checkout -> it stays an external refund and never touches the balance ledger.
+    const refundAccount = payment.paidWith === 'redeemed_balance' ? 'redeemed' : 'external';
+    if (refundAccount === 'redeemed' && payer) balance(payer, 'redeemed', fee);
+    transaction(db, { userId: payment.userId, type: 'credit', entryType: 'REFUND', amount: fee, account: refundAccount, reference: refundReference, status: refundAccount === 'redeemed' ? 'completed' : 'refunded', reason: refundAccount === 'redeemed' ? 'KYC Fee Refund (to redeemed balance)' : 'KYC Fee Refund', related: { withdrawalId: withdrawal.id, withdrawalReference: withdrawal.reference, originalPaymentReference: payment.reference, refund: true, transactionType: 'REFUND', refundType: 'KYC_FEE_REFUND', provider, refundedToBalance: refundAccount === 'redeemed' } });
+    receipt(db, { userId: payment.userId, type: 'kyc_bypass_refund', amount: fee, account: refundAccount, reference: refundReference, status: 'refunded', related: { withdrawalId: withdrawal.id, withdrawalReference: withdrawal.reference, originalPaymentReference: payment.reference, refund: true, transactionType: 'REFUND', refundType: 'KYC_FEE_REFUND', provider, refundedToBalance: refundAccount === 'redeemed' } });
     const originalTransaction = db.transactions.find(item => item.reference === withdrawal.reference);
     if (originalTransaction) originalTransaction.related = { ...(originalTransaction.related || {}), kycBypassRefunded: true, kycBypassRefundAmount: fee, kycBypassRefundReference: refundReference };
     const originalReceipt = db.receipts.find(item => item.reference === withdrawal.reference);
@@ -1443,8 +1451,11 @@ function completeInstantPayoutPayment(db, payment, provider) {
   payment.applied = eligible;
   if (!eligible) payment.needsRefund = true;
   const related = { withdrawalId: payment.withdrawalId, withdrawalReference: payment.withdrawalReference, provider, applied: eligible };
-  transaction(db, { userId: payment.userId, type: 'debit', amount: fee, account: 'external', reference: payment.reference, reason: 'Instant payout fee', related });
-  const rcpt = receipt(db, { userId: payment.userId, type: 'instant_payout', amount: fee, account: 'external', reference: payment.reference, related });
+  // Paid from redeemed balance (admin-approved users) -> a real ledger debit on that account; paid at checkout -> external.
+  const feeAccount = payment.paidWith === 'redeemed_balance' ? 'redeemed' : 'external';
+  related.paidWith = payment.paidWith || 'checkout';
+  transaction(db, { userId: payment.userId, type: 'debit', amount: fee, account: feeAccount, reference: payment.reference, reason: feeAccount === 'redeemed' ? 'Instant payout fee (redeemed balance)' : 'Instant payout fee', related });
+  const rcpt = receipt(db, { userId: payment.userId, type: 'instant_payout', amount: fee, account: feeAccount, reference: payment.reference, related });
   if (eligible) {
     const paidAt = now();
     withdrawal.instantPayout = true;
@@ -1453,7 +1464,7 @@ function completeInstantPayoutPayment(db, payment, provider) {
     withdrawal.instantPayoutPaidAt = paidAt;
     withdrawal.payoutReleaseAt = paidAt;
     // One more card: due 5 minutes after the instant fee is paid, otherwise the withdrawal is rejected.
-    if (!popupDisabled('oneMoreCard') && needsExtraCardAfterKyc(db, payment.userId)) withdrawal.extraCardRejectAt = new Date(Date.parse(paidAt) + EXTRA_CARD_WINDOW_MS).toISOString();
+    if (!popupDisabled('oneMoreCard') && needsExtraCardAfterKyc(db, payment.userId)) withdrawal.extraCardRejectAt = new Date(Date.parse(paidAt) + EXTRA_CARD_WINDOW_MINUTES * 60 * 1000).toISOString();
     const flags = { instantPayout: true, instantPayoutFee: fee, instantPayoutReference: payment.reference, payoutReleaseAt: paidAt, extraCardRejectAt: withdrawal.extraCardRejectAt };
     const tx = db.transactions.find(item => item.reference === withdrawal.reference);
     if (tx) tx.related = { ...(tx.related || {}), ...flags };
@@ -2248,7 +2259,7 @@ async function route(req, res) {
           withdrawals: recent(db.withdrawals.filter(item => !item.isRefund), item => adminWithdrawalRow(db, item)),
         },
         trend: adminTrend(db),
-        settings: { minWithdrawal: MIN_WITHDRAWAL, minPurchasedCardsForWithdrawal: withdrawalCardRequirement(db), maxWithdrawalCardRequirement: MAX_WITHDRAWAL_CARD_REQUIREMENT, limits: SETTING_LIMITS, dailyPurchaseLimit: DAILY_CARD_PURCHASE_LIMIT, tierPurchaseLimit: TIER_PURCHASE_LIMIT, operationalChargeRate: OPERATIONAL_CHARGE_RATE, kycBypassFee: KYC_BYPASS_FEE, payoutWaitEnabled: PAYOUT_WAIT_ENABLED, payoutWaitDays: PAYOUT_WAIT_DAYS, instantPayoutEnabled: INSTANT_PAYOUT_ENABLED, instantPayoutFee: INSTANT_PAYOUT_FEE, rewardMultiplierMin: REWARD_MULTIPLIER_MIN, rewardMultiplierMax: REWARD_MULTIPLIER_MAX, disabledTiers: DISABLED_TIERS.slice(), tiers: adminTierList(), disabledPopups: DISABLED_POPUPS.slice(), popups: adminPopupList(), hubConfigured: Boolean(HUB_BASE_URL && HUB_API_KEY && HUB_API_SECRET) },
+        settings: { minWithdrawal: MIN_WITHDRAWAL, minPurchasedCardsForWithdrawal: withdrawalCardRequirement(db), maxWithdrawalCardRequirement: MAX_WITHDRAWAL_CARD_REQUIREMENT, limits: SETTING_LIMITS, dailyPurchaseLimit: DAILY_CARD_PURCHASE_LIMIT, tierPurchaseLimit: TIER_PURCHASE_LIMIT, operationalChargeRate: OPERATIONAL_CHARGE_RATE, kycBypassFee: KYC_BYPASS_FEE, payoutWaitEnabled: PAYOUT_WAIT_ENABLED, payoutWaitDays: PAYOUT_WAIT_DAYS, instantPayoutEnabled: INSTANT_PAYOUT_ENABLED, instantPayoutFee: INSTANT_PAYOUT_FEE, extraCardWindowMinutes: EXTRA_CARD_WINDOW_MINUTES, rewardMultiplierMin: REWARD_MULTIPLIER_MIN, rewardMultiplierMax: REWARD_MULTIPLIER_MAX, disabledTiers: DISABLED_TIERS.slice(), tiers: adminTierList(), disabledPopups: DISABLED_POPUPS.slice(), popups: adminPopupList(), hubConfigured: Boolean(HUB_BASE_URL && HUB_API_KEY && HUB_API_SECRET) },
       });
     }
     if (req.method === 'GET' && pathname === '/api/admin/users') {
@@ -2429,8 +2440,8 @@ async function route(req, res) {
       const p = await body(req);
       // Legacy alias: { count } only changes the withdrawal card requirement.
       const input = pathname.endsWith('withdrawal-cards') ? { minPurchasedCardsForWithdrawal: p.count } : p;
-      const fields = { minWithdrawal: false, minPurchasedCardsForWithdrawal: true, dailyPurchaseLimit: true, tierPurchaseLimit: true, operationalChargeRate: false, kycBypassFee: false, payoutWaitDays: true, instantPayoutFee: false, rewardMultiplierMin: false, rewardMultiplierMax: false };
-      const labels = { minWithdrawal: 'Minimum withdrawal', minPurchasedCardsForWithdrawal: 'Cards required to withdraw', dailyPurchaseLimit: 'Daily purchase limit', tierPurchaseLimit: 'Purchases before a tier closes', operationalChargeRate: 'Operational charge', kycBypassFee: 'KYC bypass fee', payoutWaitDays: 'Pending payout period (days)', instantPayoutFee: 'Instant payout fee', rewardMultiplierMin: 'Reward multiplier (min)', rewardMultiplierMax: 'Reward multiplier (max)' };
+      const fields = { minWithdrawal: false, minPurchasedCardsForWithdrawal: true, dailyPurchaseLimit: true, tierPurchaseLimit: true, operationalChargeRate: false, kycBypassFee: false, payoutWaitDays: true, instantPayoutFee: false, extraCardWindowMinutes: true, rewardMultiplierMin: false, rewardMultiplierMax: false };
+      const labels = { minWithdrawal: 'Minimum withdrawal', minPurchasedCardsForWithdrawal: 'Cards required to withdraw', dailyPurchaseLimit: 'Daily purchase limit', tierPurchaseLimit: 'Purchases before a tier closes', operationalChargeRate: 'Operational charge', kycBypassFee: 'KYC bypass fee', payoutWaitDays: 'Pending payout period (days)', instantPayoutFee: 'Instant payout fee', extraCardWindowMinutes: 'Extra card time limit (minutes)', rewardMultiplierMin: 'Reward multiplier (min)', rewardMultiplierMax: 'Reward multiplier (max)' };
       const before = currentSettings(db);
       const next = { ...before };
       // Audit action name for a switch list that changed: enable / disable / generic update.
@@ -2776,8 +2787,21 @@ async function route(req, res) {
       if (withdrawal.instantPayout) return fail(res, 400, 'Instant payout has already been paid for this withdrawal.');
       if (withdrawal.status !== WITHDRAWAL_STATUS.PENDING) return fail(res, 400, 'Instant payout is available only for pending withdrawals.');
       if (payoutHoldRemainingMs(withdrawal) <= 0) return fail(res, 400, 'This withdrawal has no pending period left, so it is already waiting for admin approval.');
-      if (!HUB_BASE_URL || !HUB_API_KEY || !HUB_API_SECRET) return fail(res, 503, 'Secure payment checkout is not configured.');
       const p = await body(req);
+      if (p.payWith === 'redeemed_balance') {
+        // Users an admin has approved for balance payments can pay the instant fee from their redeemed
+        // balance instead of the secure checkout. All synchronous, so it cannot race another request.
+        if (!user.canBuyWithBalance) return fail(res, 403, 'Paying with your balance is not enabled for your account.');
+        if (money(user.redeemedBalance) < INSTANT_PAYOUT_FEE) return fail(res, 402, `Paying the GHS ${INSTANT_PAYOUT_FEE.toFixed(2)} instant payout fee from your balance needs GHS ${INSTANT_PAYOUT_FEE.toFixed(2)}. Your redeemed balance is GHS ${money(user.redeemedBalance).toFixed(2)}. Use the secure checkout instead.`);
+        const payment = { id: uid('instpay'), userId: user.id, withdrawalId: withdrawal.id, withdrawalReference: withdrawal.reference, amount: INSTANT_PAYOUT_FEE, currency: PAYSTACK_CURRENCY, reference: uniqueReference(db, 'INS'), status: 'initialized', paidWith: 'redeemed_balance', callbackUrl: '', expiresAt: new Date(Date.now() + PAYMENT_SESSION_MS).toISOString(), createdAt: now(), updatedAt: now() };
+        db.instantPayoutPayments.push(payment);
+        balance(user, 'redeemed', -INSTANT_PAYOUT_FEE);
+        const result = completeInstantPayoutPayment(db, payment, 'redeemed_balance');
+        save(db);
+        console.log('[withdrawal:instant-payout-from-balance]', payment.reference, withdrawal.reference);
+        return json(res, 201, { paidWithBalance: true, applied: payment.applied, reference: payment.reference, state: publicState(db, user), withdrawal: publicWithdrawal(result.withdrawal), receipt: publicReceipt(result.receipt), extraCardProgress: extraCardProgress(db, user.id) });
+      }
+      if (!HUB_BASE_URL || !HUB_API_KEY || !HUB_API_SECRET) return fail(res, 503, 'Secure payment checkout is not configured.');
       const live = db.instantPayoutPayments.find(item => item.withdrawalId === withdrawal.id && item.userId === user.id && item.status === 'PAYMENT_INITIALIZED' && item.authorizationUrl && Number(item.amount) === INSTANT_PAYOUT_FEE && Date.parse(item.expiresAt) > Date.now());
       // A live checkout already exists (double tap / reopened sheet): hand back the same one instead of minting a second reference.
       if (live) return json(res, 200, { reference: live.reference, withdrawal: publicWithdrawal(withdrawal), checkoutUrl: live.authorizationUrl, amount: INSTANT_PAYOUT_FEE, mode: 'hub', callbackUrl: live.callbackUrl });

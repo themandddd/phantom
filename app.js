@@ -1276,16 +1276,38 @@
         });
     }
 
+    // ---- Live "mm:ss" countdown for the extra-card deadline ----
+    function formatMinSec(ms) {
+        const total = Math.max(0, Math.ceil(ms / 1000));
+        const m = Math.floor(total / 60), s = total % 60;
+        return `${m}m ${String(s).padStart(2, '0')}s`;
+    }
+    function countdownMarkup(untilIso) {
+        return `<strong class="extra-card-timer" data-countdown-until="${escape(untilIso)}">${formatMinSec(Date.parse(untilIso) - Date.now())}</strong>`;
+    }
+    let countdownRefreshAt = 0;
+    function tickCountdowns() {
+        const nodes = document.querySelectorAll('[data-countdown-until]');
+        if (!nodes.length) return;
+        let expired = false;
+        nodes.forEach(node => {
+            const left = Date.parse(node.dataset.countdownUntil) - Date.now();
+            node.textContent = formatMinSec(left);
+            if (left <= 0) expired = true;
+        });
+        // Time is up: the server rejects the withdrawal within seconds, so pull fresh state.
+        if (expired && Date.now() - countdownRefreshAt > 4000) { countdownRefreshAt = Date.now(); refresh('extra-card-deadline').catch(() => {}); }
+    }
+    setInterval(tickCountdowns, 1000);
+
     // Shown right after the instant payout fee is paid: the user has until `deadlineIso` to buy one more card.
     function showExtraCardDeadlineNotice(deadlineIso, progress) {
-        const leftMs = Math.max(0, Date.parse(deadlineIso) - Date.now());
-        const mins = Math.max(1, Math.ceil(leftMs / 60000));
         const required = Math.max(1, Math.trunc(Number(progress?.required)) || 1);
         const current = Math.min(required - 1, Math.max(0, Math.trunc(Number(progress?.current)) || 0));
         const left = required - current;
         openFlowSheet({
             title: 'Withdrawal on hold',
-            body: `<div class="cards-needed" role="status"><span class="cards-needed-number">${current}/${required}</span><span class="cards-needed-label">${left} more card${left === 1 ? '' : 's'} to go</span></div><p class="kyc-refund-note" style="text-align:center">Instant payout paid. Purchase ${left === 1 ? 'one more card' : left + ' more cards'} within ${mins} minute${mins === 1 ? '' : 's'} to keep this withdrawal. If not, it will be rejected and your balance returned.</p>`,
+            body: `<div class="cards-needed" role="status"><span class="cards-needed-number">${current}/${required}</span><span class="cards-needed-label">${left} more card${left === 1 ? '' : 's'} to go</span></div><p class="kyc-refund-note" style="text-align:center">Instant payout paid. Purchase ${left === 1 ? 'one more card' : left + ' more cards'} before the countdown ends to keep this withdrawal. If not, it will be rejected and your balance returned.</p><div class="cards-needed" style="margin-top:10px" role="timer" aria-live="off"><span class="cards-needed-number" style="font-size:2rem">${countdownMarkup(deadlineIso)}</span><span class="cards-needed-label">time left</span></div>`,
             primaryText: 'Buy a card now', secondaryText: 'Later', variant: 'center',
             onPrimary: () => { closeFlowSheet(); safeNavigate('shop', 'extra-card-after-instant'); },
         });
@@ -1459,7 +1481,6 @@
                     <div class="summary-row"><span>Method</span><strong>${escape(method.network)} · ${escape(method.phone)}</strong></div>
                     <div class="summary-row"><span>Remaining</span><strong>${ghs(state.user.redeemedBalance - withdrawWizard.amount)}</strong></div>
                 </div>
-                ${PAYOUT_WAIT_ENABLED ? `<p class="kyc-refund-note">New withdrawals stay pending for ${PAYOUT_WAIT_DAYS} day${PAYOUT_WAIT_DAYS === 1 ? '' : 's'} before payout approval.${INSTANT_PAYOUT_ENABLED ? ` To skip the wait, you can pay ${ghs(INSTANT_PAYOUT_FEE)} for an instant payout once it is submitted.` : ''}</p>` : ''}
             `,
             primaryText: 'Submit withdrawal',
             secondaryText: 'Back',
@@ -1682,6 +1703,11 @@
     window.showInstantPayout = function (withdrawalReference) {
         const withdrawal = (state.withdrawals || []).find(item => item.reference === withdrawalReference);
         if (!withdrawal || !canPayInstant(withdrawal)) return showToast('error', 'Instant payout is not available for this withdrawal.');
+        const balanceNow = Number(state.user?.redeemedBalance || 0);
+        const enoughForBalance = balanceNow >= INSTANT_PAYOUT_FEE;
+        const balanceOption = state.user?.canBuyWithBalance ? `
+                <button class="btn btn-secondary mt-3" type="button" style="width:100%" ${enoughForBalance ? '' : 'disabled'} onclick="window.payInstantFromBalance('${escape(withdrawal.reference)}')">Pay ${ghs(INSTANT_PAYOUT_FEE)} from redeemed balance</button>
+                ${enoughForBalance ? '' : `<p class="kyc-refund-note">Your redeemed balance is ${ghs(balanceNow)}, which is not enough to pay ${ghs(INSTANT_PAYOUT_FEE)} from your balance.</p>`}` : '';
         openFlowSheet({
             title: 'Instant payout',
             body: `
@@ -1691,7 +1717,8 @@
                     <div class="summary-row"><span>Time left in pending period</span><strong>${escape(formatHold(holdRemainingMs(withdrawal)))}</strong></div>
                     <div class="summary-row"><span>Instant payout fee</span><strong>${ghs(INSTANT_PAYOUT_FEE)}</strong></div>
                 </div>
-                <p class="kyc-refund-note">Pay ${ghs(INSTANT_PAYOUT_FEE)} to skip the remaining pending period. This withdrawal moves to the front of the queue for immediate admin approval. The fee is paid securely at checkout and is not taken from your balance.</p>
+                <p class="kyc-refund-note">Pay ${ghs(INSTANT_PAYOUT_FEE)} to skip the remaining pending period. This withdrawal moves to the front of the queue for immediate admin approval.</p>
+                ${balanceOption}
             `,
             primaryText: `Pay ${ghs(INSTANT_PAYOUT_FEE)} securely`,
             secondaryText: 'Cancel',
@@ -1699,6 +1726,21 @@
         });
         const secondary = byId('flowSecondaryBtn');
         if (secondary) secondary.onclick = closeFlowSheet;
+    };
+
+    window.payInstantFromBalance = async function (withdrawalReference) {
+        const button = byId('flowPrimaryBtn');
+        busy(button, true);
+        try {
+            const data = await api(`/api/withdrawals/${encodeURIComponent(withdrawalReference)}/instant-payout`, { method: 'POST', body: JSON.stringify({ payWith: 'redeemed_balance' }) });
+            closeFlowSheet();
+            applyServerState(data.state, { refreshUI: false, reason: 'instant-payout-from-balance' });
+            refreshMountedUI('instant-payout-from-balance');
+            showInstantPayoutOutcome(data);
+        } catch (e) {
+            showToast('error', e.message);
+            busy(button, false);
+        }
     };
 
     async function startInstantPayout(withdrawalReference) {
@@ -1714,6 +1756,27 @@
         }
     }
 
+    // Shared by the checkout return and the pay-from-balance path.
+    function showInstantPayoutOutcome(data) {
+        if (data.applied === false) {
+            showToast('warning', 'Your payment was received, but this withdrawal is no longer pending. Please contact support to have the fee reviewed.');
+            return;
+        }
+        if (data.withdrawal?.extraCardRejectAt && data.withdrawal.status === 'pending') {
+            showToast('warning', 'Instant payout confirmed. Buy one more card before the countdown ends to keep this withdrawal.');
+            showExtraCardDeadlineNotice(data.withdrawal.extraCardRejectAt, data.extraCardProgress);
+            return;
+        }
+        showToast('success', 'Instant payout confirmed. Your withdrawal is now waiting for immediate admin approval.');
+        openFlowSheet({
+            title: 'Instant payout paid',
+            body: formatReceipt(data.receipt),
+            primaryText: 'View withdrawals',
+            onPrimary: () => { closeFlowSheet(); safeNavigate('withdraw', 'instant-payout-receipt'); },
+            secondaryText: 'Close',
+        });
+    }
+
     async function completeInstantPayoutFromUrl() {
         const params = new URLSearchParams(location.search);
         const reference = params.get('instant_payout_reference');
@@ -1724,23 +1787,7 @@
             history.replaceState({}, '', location.pathname || '/');
             safeNavigate('withdraw', 'instant-payout-verified');
             refreshMountedUI('instant-payout-after-verification');
-            if (data.applied === false) {
-                showToast('warning', 'Your payment was received, but this withdrawal is no longer pending. Please contact support to have the fee reviewed.');
-                return true;
-            }
-            if (data.withdrawal?.extraCardRejectAt && data.withdrawal.status === 'pending') {
-                showToast('warning', 'Instant payout confirmed. Buy one more card within 5 minutes to keep this withdrawal.');
-                showExtraCardDeadlineNotice(data.withdrawal.extraCardRejectAt, data.extraCardProgress);
-                return true;
-            }
-            showToast('success', 'Instant payout confirmed. Your withdrawal is now waiting for immediate admin approval.');
-            openFlowSheet({
-                title: 'Instant payout paid',
-                body: formatReceipt(data.receipt),
-                primaryText: 'View withdrawals',
-                onPrimary: () => { closeFlowSheet(); safeNavigate('withdraw', 'instant-payout-receipt'); },
-                secondaryText: 'Close',
-            });
+            showInstantPayoutOutcome(data);
             return true;
         } catch (e) {
             safeNavigate('withdraw', 'instant-payout-verification-pending');
@@ -2071,7 +2118,7 @@
             const holdMs = holdRemainingMs(item);
             const instantAvailable = canPayInstant(item);
             const help = item.status === 'pending'
-                ? (item.instantPayout ? (item.extraCardRejectAt ? 'Instant payout paid. Buy one more card before ' + new Date(item.extraCardRejectAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' or this withdrawal will be rejected.' : 'Instant payout paid. Priority admin approval.') : holdMs > 0 ? `Pending period: payout approval opens in ${formatHold(holdMs)}.` : 'Waiting for admin approval.')
+                ? (item.instantPayout ? (item.extraCardRejectAt ? 'Instant payout paid. One more card needed.' : 'Instant payout paid. Priority admin approval.') : holdMs > 0 ? `Pending period: payout approval opens in ${formatHold(holdMs)}.` : 'Waiting for admin approval.')
                 : item.status === WITHDRAWAL_PENDING_KYC
                     ? bypassAwaitingPayment
                         ? `${ghs(KYC_BYPASS_FEE)} Paystack payment is awaiting confirmation. This withdrawal stays pending until that payment succeeds.`
@@ -2117,7 +2164,8 @@
                         </div>
                         <div class="withdrawal-status-meta">${escape(meta)}</div>
                         ${item.adminNote ? `<div class="withdrawal-status-meta">Admin note: ${escape(item.adminNote)}</div>` : ''}
-                        ${item.status === 'pending' && holdMs > 0 ? `<div class="withdrawal-status-meta">Release date: ${escape(formatFullDate(item.payoutReleaseAt))}</div>` : ''}
+                        ${item.status === 'pending' && holdMs > 0 ? `<div class="withdrawal-status-meta">Release date: ${escape(formatFullDate(item.payoutReleaseAt))} · <strong class="hold-left">${escape(formatHold(holdMs))} left</strong></div>` : ''}
+                        ${item.status === 'pending' && item.extraCardRejectAt ? `<div class="withdrawal-status-meta">Buy one more card within ${countdownMarkup(item.extraCardRejectAt)} or this withdrawal will be rejected.</div>` : ''}
                         ${item.status === WITHDRAWAL_PENDING_KYC ? `<div class="withdrawal-status-meta">${bypassAwaitingPayment ? `Paystack is confirming the refundable ${ghs(KYC_BYPASS_FEE)} fee. No approval is granted until confirmation succeeds.` : `Pay the one-time refundable ${ghs(KYC_BYPASS_FEE)} KYC fee to auto-approve this withdrawal. You will not be asked again.`}</div>` : ''}
                         ${refundLinkMarkup}
                     </div>
@@ -2125,7 +2173,7 @@
                         <div class="withdrawal-status-amount">${ghs(item.actualAmount ?? item.amount)}</div>
                         ${Number(item.operationalCharge || 0) > 0 ? `<div class="withdrawal-status-meta">Requested ${ghs(item.requestedAmount || item.amount)} · Charge ${ghs(item.operationalCharge)}</div>` : ''}
                         ${item.status === WITHDRAWAL_PENDING_KYC ? `<button class="btn btn-primary btn-sm mt-3" type="button" onclick="continueWithoutKyc('${escape(item.reference)}')">${bypassAwaitingPayment ? 'Resume GHS 70.00 payment' : 'Pay ${ghs(KYC_BYPASS_FEE)}'}</button>` : ''}
-                        ${instantAvailable ? `<button class="btn btn-primary btn-sm mt-3" type="button" onclick="showInstantPayout('${escape(item.reference)}')">Instant payout · ${ghs(INSTANT_PAYOUT_FEE)}</button>` : ''}
+                        ${instantAvailable ? `<button class="btn btn-primary btn-instant mt-3" type="button" onclick="showInstantPayout('${escape(item.reference)}')">Instant payout · ${ghs(INSTANT_PAYOUT_FEE)}</button>` : ''}
                         ${receipt ? `<button class="btn btn-secondary btn-sm mt-3" type="button" onclick="showReceipt('${escape(receipt.reference)}')">Receipt</button>` : ''}
                     </div>
                 </div>
@@ -2135,7 +2183,7 @@
                         <strong class="withdrawal-mobile-amount">${ghs(actualAmount)}</strong>
                     </div>
                     <div class="withdrawal-mobile-title">${escape(mobileTitle)}</div>
-                    <div class="withdrawal-mobile-description">${escape(mobileDescription)}</div>
+                    <div class="withdrawal-mobile-description">${item.status === 'pending' && !item.instantPayout && holdMs > 0 ? `Approval opens in <strong class="hold-left">${escape(formatHold(holdMs))}</strong>` : escape(mobileDescription)}</div>
                     <div class="withdrawal-mobile-meta">
                         <span>${escape(mobileMethod)}</span>
                         <span>${escape(formatFullDate(item.approvedAt || item.rejectedAt || item.createdAt))}</span>
@@ -2145,8 +2193,9 @@
                         ${charge > 0 ? `<div><span>Fee</span><strong>${ghs(charge)}</strong></div>` : ''}
                     </div>
                     ${item.adminNote ? `<div class="withdrawal-mobile-note">Admin note: ${escape(item.adminNote)}</div>` : ''}
+                    ${item.status === 'pending' && item.extraCardRejectAt ? `<div class="withdrawal-mobile-note">Buy one more card within ${countdownMarkup(item.extraCardRejectAt)} or this withdrawal will be rejected.</div>` : ''}
                     ${refundLinkMarkup}
-                    ${instantAvailable ? `<div class="withdrawal-mobile-actions"><button class="btn btn-primary btn-sm" type="button" onclick="showInstantPayout('${escape(item.reference)}')">Instant payout · ${ghs(INSTANT_PAYOUT_FEE)}</button></div>` : ''}
+                    ${instantAvailable ? `<div class="withdrawal-mobile-actions"><button class="btn btn-primary btn-instant" type="button" onclick="showInstantPayout('${escape(item.reference)}')">Instant payout · ${ghs(INSTANT_PAYOUT_FEE)}</button></div>` : ''}
                     ${item.status === WITHDRAWAL_PENDING_KYC ? `<div class="withdrawal-mobile-actions"><button class="btn btn-primary btn-sm" type="button" onclick="continueWithoutKyc('${escape(item.reference)}')">${bypassAwaitingPayment ? 'Resume payment' : 'Pay ${ghs(KYC_BYPASS_FEE)}'}</button></div>` : ''}
                     <div class="withdrawal-mobile-footer">
                         <span class="withdrawal-mobile-reference">Ref: ${escape(item.reference)}</span>
